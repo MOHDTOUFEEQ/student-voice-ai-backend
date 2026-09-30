@@ -22,7 +22,8 @@ def create_app() -> FastAPI:
     application.state.limiter = limiter
     application.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    origins = [settings.frontend_url, "http://localhost:5173", "http://127.0.0.1:5173"]
+    origins = [settings.frontend_url, "https://www.studentvoice.uk",
+    "https://studentvoice.uk","http://localhost:5173", "http://127.0.0.1:5173"]
     application.add_middleware(SlowAPIMiddleware)
     application.add_middleware(
         CORSMiddleware,
