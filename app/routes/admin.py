@@ -26,7 +26,7 @@ from app.services.analytics_service import (
     suggestions_by_theme,
 )
 from app.services.audit_service import log_action
-from app.services.feedback_service import delete_submission, list_admin, retry_pending, update_submission_admin
+from app.services.feedback_service import delete_submission, list_admin, update_submission_admin
 from app.services.issue_service import list_issues, update_issue
 from app.services.meeting_service import create as create_meeting, list_admin as list_meetings_admin, update as update_meeting
 from app.services.report_service import build_academic_report, build_weekly_report, report_to_csv, report_to_pdf
@@ -247,12 +247,6 @@ async def audit_logs(admin: str = Depends(get_current_admin)):
     for d in docs:
         d["id"] = str(d.pop("_id"))
     return {"items": docs}
-
-
-@router.post("/processing/retry")
-async def processing_retry(admin: str = Depends(get_current_admin)):
-    count = await retry_pending()
-    return {"retried": count}
 
 
 @router.post("/maintenance/purge-retention")

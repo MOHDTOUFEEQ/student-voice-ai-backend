@@ -4,9 +4,7 @@ from typing import Any
 from bson import ObjectId
 
 from app.database import get_database
-from app.services import ai_service
 from app.services.academic_week_service import get_current_academic_week
-from app.services.issue_service import sync_issues_for_week
 
 
 def _serialize(doc: dict[str, Any]) -> dict[str, Any]:
@@ -25,86 +23,17 @@ async def create_submission(
     now = datetime.now(timezone.utc)
     doc: dict[str, Any] = {
         "type": submission_type,
-        "message": message.strip(),
+        # Store the exact submitted text without translation or analysis.
+        "message": message,
         "category": category,
         "importance": importance,
         "academic_week": week,
-        "sentiment": None,
-        "ai_category": None,
-        "ai_priority": None,
-        "ai_themes": [],
-        "ai_flags": [],
-        "is_spam": False,
-        "is_toxic": False,
-        "is_sensitive": False,
-        "processing_status": "pending",
+        "processing_status": "stored",
         "created_at": now,
     }
     result = await db["Feedback"].insert_one(doc)
     doc["_id"] = result.inserted_id
-    await _process_submission_async(str(result.inserted_id))
-    refreshed = await db["Feedback"].find_one({"_id": result.inserted_id})
-    return _serialize(refreshed or doc)
-
-
-async def _process_submission_async(feedback_id: str) -> None:
-    db = get_database()
-    oid = ObjectId(feedback_id)
-    doc = await db["Feedback"].find_one({"_id": oid})
-    if not doc:
-        return
-    try:
-        analysis = ai_service.process_submission(
-            doc["message"], doc["category"], doc["importance"]
-        )
-        week = doc["academic_week"]
-        recent = (
-            await db["Feedback"]
-            .find(
-                {
-                    "academic_week": week,
-                    "type": doc["type"],
-                    "_id": {"$ne": oid},
-                    "processing_status": "processed",
-                }
-            )
-            .sort("created_at", -1)
-            .limit(30)
-            .to_list(30)
-        )
-        dup_indices = ai_service.detect_duplicates(
-            doc["message"], [r["message"] for r in recent]
-        )
-        duplicate_of = [str(recent[i]["_id"]) for i in dup_indices if i < len(recent)]
-
-        update = {
-            **analysis,
-            "processing_status": "processed",
-            "duplicate_group_ids": duplicate_of,
-        }
-        if doc["type"] == "feedback":
-            update["sentiment"] = analysis.get("sentiment")
-        await db["Feedback"].update_one({"_id": oid}, {"$set": update})
-        await sync_issues_for_week(week)
-    except Exception:
-        await db["Feedback"].update_one(
-            {"_id": oid},
-            {"$set": {"processing_status": "pending"}},
-        )
-
-
-async def retry_pending(limit: int = 20) -> int:
-    db = get_database()
-    pending = (
-        await db["Feedback"]
-        .find({"processing_status": "pending"})
-        .sort("created_at", 1)
-        .limit(limit)
-        .to_list(limit)
-    )
-    for doc in pending:
-        await _process_submission_async(str(doc["_id"]))
-    return len(pending)
+    return _serialize(doc)
 
 
 async def list_admin(
