@@ -16,10 +16,10 @@ async def get_or_generate_weekly_insights(week: int) -> dict[str, Any]:
 
     stats = await overview_stats()
     issues = await get_public_weekly_issues(week)
-    feedback_count = await db["Feedback"].count_documents({"academic_week": week, "type": "feedback"})
-    suggestion_count = await db["Feedback"].count_documents({"academic_week": week, "type": "suggestion"})
+    feedback_count = await db["Issues"].count_documents({"academic_week": week, "type": "feedback"})
+    suggestion_count = await db["Issues"].count_documents({"academic_week": week, "type": "suggestion"})
 
-    themes = await db["Feedback"].aggregate(
+    themes = await db["Issues"].aggregate(
         [
             {"$match": {"academic_week": week}},
             {"$unwind": "$ai_themes"},

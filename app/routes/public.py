@@ -29,9 +29,9 @@ async def categories():
 
 
 @router.get("/weekly/issues")
-async def weekly_issues(week: int | None = None, lang: str = "en"):
+async def weekly_issues(week: int | None = None):
     w = week or await get_current_academic_week()
-    return await get_public_weekly_issues(w, lang=lang)
+    return await get_public_weekly_issues(w)
 
 
 @router.get("/weekly/updates")
@@ -42,9 +42,9 @@ async def weekly_updates(week: int | None = None):
 
 
 @router.post("/ai/suggest-feedback")
-async def suggest_feedback(payload: AISuggestFeedbackRequest, lang: str = "en"):
+async def suggest_feedback(payload: AISuggestFeedbackRequest):
     try:
-        message = ai_service.suggest_feedback_example(payload.category, language=lang)
+        message = ai_service.suggest_feedback_example(payload.category)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="AI suggestion temporarily unavailable") from exc
     return {"message": message}

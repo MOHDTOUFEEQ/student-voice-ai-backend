@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 PROMPT_VERSION = "v1"
 
 SYSTEM_ANALYSIS = (
-    "You analyze anonymous MSc student feedback in any language (English, Chinese, Japanese, etc.). "
-    "Never infer or mention who wrote feedback. Understand meaning in the original language; "
-    "use English only for normalized admin fields (summaries, themes, issue titles). "
+    "You analyze anonymous MSc student feedback in English. "
+    "Never infer or mention who wrote feedback. "
     "Negative criticism is legitimate; only mark toxic for abuse, harassment, threats, or hate. "
     "Respond with valid JSON only."
 )
@@ -56,11 +55,10 @@ def classify_feedback(message: str, category: str, importance: str) -> dict[str,
         f"Classify this anonymous submission.\n"
         f"Student category: {category}\nStudent importance: {importance}\n"
         f"Message: {message}\n\n"
-        "Return JSON keys: detected_language (BCP-47, e.g. en, zh-CN, zh-TW, ja), "
-        "message_en_summary (short English paraphrase for admins, not a quote), ai_category (one of "
+        "Return JSON keys: ai_category (one of "
         + json.dumps(FEEDBACK_CATEGORIES)
         + "), sentiment (positive|neutral|negative), ai_priority (low|medium|high|critical), "
-        "ai_themes (English theme slugs, max 5), is_spam (bool), is_toxic (bool), is_sensitive (bool), "
+        "ai_themes (string array, max 5), is_spam (bool), is_toxic (bool), is_sensitive (bool), "
         "ai_flags (string array, e.g. safeguarding if sensitive)."
     )
     data = _chat_json(SYSTEM_ANALYSIS, user)
@@ -83,14 +81,11 @@ def _normalize_classification(data: dict[str, Any]) -> dict[str, Any]:
     flags = data.get("ai_flags") or []
     if not isinstance(flags, list):
         flags = []
-    detected = str(data.get("detected_language") or "en")
     return {
         "ai_category": ai_category,
         "sentiment": sentiment,
         "ai_priority": ai_priority,
         "ai_themes": [str(t) for t in themes[:5]],
-        "detected_language": detected,
-        "message_en_summary": str(data.get("message_en_summary") or "")[:500],
         "is_spam": bool(data.get("is_spam")),
         "is_toxic": bool(data.get("is_toxic")),
         "is_sensitive": bool(data.get("is_sensitive")),
@@ -240,90 +235,113 @@ def answer_admin_question(question: str, context: dict[str, Any]) -> str:
     return data.get("answer") or data.get("response") or json.dumps(data)
 
 
-def suggest_feedback_example(category: str | None = None, language: str = "en") -> str:
+def suggest_feedback_example(category: str | None = None) -> str:
     cat = category or "Student Experience"
     user = (
         f"Generate one realistic anonymous MSc student feedback example about {cat}. "
-        f"Write in language/locale: {language}. "
-        "Plain text only, 1-3 sentences, no names or identifying details. Return JSON: message"
+        "Write in English. Plain text only, 1-3 sentences, no names or identifying details. Return JSON: message"
     )
     data = _chat_json(SYSTEM_ANALYSIS, user, max_tokens=150)
     return data.get("message") or "The balance between lectures and independent study could be clearer this week."
 
 
-PUBLIC_LANGS = ("en", "zh-CN", "zh-TW", "ja")
-
-
-def cluster_weekly_issues(submissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group multilingual feedback into distinct underlying issues (max 4)."""
+def summarize_weekly_feedback_themes(submissions: list[dict[str, Any]], max_points: int = 5) -> list[dict[str, Any]]:
+    """
+    Use AI to consolidate anonymous feedback into a small set of specific main points.
+    Each point should clearly state what students are actually trying to say.
+    """
     if not submissions:
         return []
+
     payload = [
         {
-            "summary_en": s.get("message_en_summary") or s.get("message", "")[:200],
-            "themes": s.get("ai_themes") or [],
-            "language": s.get("detected_language") or "en",
-            "importance": s.get("importance"),
-            "sentiment": s.get("sentiment"),
+            "message": str(s.get("message") or "")[:500],
+            "category": s.get("category") or "Other",
+            "importance": s.get("importance") or "medium",
         }
         for s in submissions[:80]
+        if str(s.get("message") or "").strip()
     ]
+    if not payload:
+        return []
+
     user = (
-        "Cluster these anonymous submissions into DISTINCT underlying issues. "
-        "Merge similar concerns across languages (e.g. printer complaints → one issue). "
-        "Return JSON: clusters (array, max 4 items). Each cluster: "
-        "issue_key (slug), frequency (int), strength (0-1), title_en, summary_en "
-        "(1-2 sentences, aggregated, no student quotes), "
-        "titles {en, zh-CN, zh-TW, ja}, summaries {en, zh-CN, zh-TW, ja}. "
-        "Only include genuinely different themes; do not duplicate near-synonyms.\n"
-        + json.dumps(payload)
+        f"You are summarizing anonymous MSc student feedback for a public weekly issues page.\n"
+        f"Read the submissions carefully and consolidate them into at most {max_points} main points.\n\n"
+        "Rules:\n"
+        "- Each point must capture a specific issue or common theme students are actually raising.\n"
+        "- Merge similar feedback into one point (e.g. printer availability + more printers needed → Printing Facilities).\n"
+        "- Prefer fewer strong points over many weak ones. Use fewer than "
+        f"{max_points} if there are not that many distinct themes.\n"
+        "- Do NOT invent issues that are not supported by the submissions.\n"
+        "- Do NOT quote individual students or include identifying details.\n"
+        "- Titles should be short and specific (e.g. 'Printing Facilities', not just 'Facilities').\n"
+        "- Summaries should clearly rephrase what students are trying to say in 1–2 sentences.\n\n"
+        "Return JSON with key 'points' (array). Each item:\n"
+        "  title (string), summary (string), frequency (int estimate of how many submissions relate).\n\n"
+        f"Submissions:\n{json.dumps(payload)}"
     )
     try:
         data = _chat_json(SYSTEM_ANALYSIS, user, max_tokens=1200)
-        clusters = data.get("clusters") or []
-        return [_normalize_cluster(c) for c in clusters if isinstance(c, dict)]
+        points = data.get("points") or data.get("clusters") or []
+        normalized: list[dict[str, Any]] = []
+        for raw in points:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            summary = str(raw.get("summary") or "").strip()
+            if not title or not summary:
+                continue
+            normalized.append(
+                {
+                    "title": title[:120],
+                    "summary": summary[:500],
+                    "frequency": int(raw.get("frequency") or 1),
+                }
+            )
+        return normalized[:max_points]
     except Exception:
-        logger.exception("Issue clustering failed, using fallback")
-        return _fallback_clusters(submissions)
+        logger.exception("Weekly theme summarization failed, using fallback")
+        return _fallback_clusters(submissions)[:max_points]
 
 
-def _normalize_cluster(raw: dict[str, Any]) -> dict[str, Any]:
-    titles = raw.get("titles") if isinstance(raw.get("titles"), dict) else {}
-    summaries = raw.get("summaries") if isinstance(raw.get("summaries"), dict) else {}
-    title_en = str(raw.get("title_en") or titles.get("en") or "General concerns")
-    summary_en = str(raw.get("summary_en") or summaries.get("en") or "")
-    for lang in PUBLIC_LANGS:
-        titles.setdefault(lang, title_en)
-        summaries.setdefault(lang, summary_en)
-    return {
-        "issue_key": str(raw.get("issue_key") or title_en.lower().replace(" ", "-")[:40]),
-        "frequency": int(raw.get("frequency") or 1),
-        "strength": float(raw.get("strength") or 0.5),
-        "title": title_en,
-        "ai_summary": summary_en,
-        "localized_titles": {k: str(titles[k]) for k in PUBLIC_LANGS},
-        "localized_summaries": {k: str(summaries[k]) for k in PUBLIC_LANGS},
-    }
+def cluster_weekly_issues(submissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Backward-compatible wrapper — prefer summarize_weekly_feedback_themes."""
+    points = summarize_weekly_feedback_themes(submissions, max_points=5)
+    return [
+        {
+            "issue_key": p["title"].lower().replace(" ", "-")[:40],
+            "frequency": p.get("frequency", 1),
+            "strength": 0.5,
+            "title": p["title"],
+            "ai_summary": p["summary"],
+        }
+        for p in points
+    ]
 
 
 def _fallback_clusters(submissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for s in submissions:
-        key = (s.get("ai_themes") or ["general"])[0]
+        key = s.get("category") or (s.get("ai_themes") or ["general"])[0]
         buckets.setdefault(str(key), []).append(s)
     clusters = []
-    for key, items in sorted(buckets.items(), key=lambda x: len(x[1]), reverse=True)[:4]:
+    for key, items in sorted(buckets.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
         title = str(key).replace("_", " ").title()
-        summary = f"Students have raised concerns related to {title.lower()}."
+        # Prefer a short rephrasing from the first message when AI is unavailable.
+        sample = str(items[0].get("message") or "").strip()
+        if sample:
+            summary = sample if len(sample) <= 180 else sample[:177].rstrip() + "..."
+        else:
+            summary = f"Students have raised concerns related to {title.lower()}."
         clusters.append(
             {
-                "issue_key": key,
-                "frequency": len(items),
-                "strength": min(1.0, len(items) / 3),
                 "title": title,
+                "summary": summary,
+                "frequency": len(items),
+                "issue_key": key,
+                "strength": min(1.0, len(items) / 3),
                 "ai_summary": summary,
-                "localized_titles": {lang: title for lang in PUBLIC_LANGS},
-                "localized_summaries": {lang: summary for lang in PUBLIC_LANGS},
             }
         )
     return clusters

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     academic_week_3_start_date: str = "2026-10-05"
     academic_total_weeks: int = 11
     frontend_url: str = "http://localhost:5173"
+    cors_origins: str = ""
     environment: str = "development"
     access_token_expire_minutes: int = 60 * 8
     openai_model: str = "gpt-5.4-mini"

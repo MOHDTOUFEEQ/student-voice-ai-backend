@@ -1,120 +1,71 @@
 from datetime import datetime, timezone
 from typing import Any
 
+from bson import ObjectId
+
 from app.database import get_database
 from app.services import ai_service
 
 
-def _effective_priority(doc: dict[str, Any]) -> str:
-    return doc.get("admin_priority_override") or doc.get("ai_priority") or doc.get("importance") or "medium"
-
-
-def _limit_public_clusters(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ranked = sorted(clusters, key=lambda c: (c.get("frequency", 0), c.get("strength", 0)), reverse=True)
-    if len(ranked) <= 3:
-        return ranked
-    top = ranked[:4]
-    if len(top) == 4 and top[3].get("frequency", 0) < 2 and top[2].get("frequency", 0) >= 2:
-        return top[:3]
-    return top[:4]
-
-
-async def sync_issues_for_week(week: int) -> None:
+async def get_public_weekly_issues(week: int) -> dict[str, Any]:
+    """
+    Build public Weekly Issues from the Issues collection.
+    Uses ChatGPT to consolidate raw feedback into up to 5 specific main points.
+    Results are cached in WeeklyInsights so we do not call AI on every page load.
+    """
     db = get_database()
+
     submissions = (
-        await db["Feedback"]
+        await db["Issues"]
         .find(
             {
                 "academic_week": week,
-                "type": "feedback",
-                "processing_status": "processed",
-                "is_spam": False,
+                "$or": [{"type": "feedback"}, {"type": {"$exists": False}}],
+                "message": {"$exists": True, "$ne": ""},
             }
         )
-        .to_list(200)
+        .sort("created_at", -1)
+        .to_list(100)
     )
+
     if not submissions:
-        await db["Issues"].delete_many({"academic_week": week})
-        return
+        return {"academic_week": week, "most_frequent": []}
 
-    clusters = ai_service.cluster_weekly_issues(submissions)
-    seen_keys: set[str] = set()
-    for cluster in clusters:
-        issue_key = cluster["issue_key"]
-        seen_keys.add(issue_key)
-        existing = await db["Issues"].find_one({"issue_key": issue_key, "academic_week": week})
-        freq = cluster.get("frequency", 1)
-        priority = ai_service.calculate_priority(
-            freq,
-            [s.get("importance", "medium") for s in submissions],
-            1,
-            "negative",
-        )
-        trend = "Stable"
-        if existing:
-            prev_freq = existing.get("frequency", 0)
-            if freq > prev_freq:
-                trend = "Increasing"
-            elif freq < prev_freq:
-                trend = "Decreasing"
-        payload = {
-            "issue_key": issue_key,
-            "title": cluster["title"],
-            "description": cluster["ai_summary"],
-            "frequency": freq,
-            "priority": priority,
-            "trend": trend,
-            "status": existing.get("status", "New") if existing else "New",
-            "ai_summary": cluster["ai_summary"],
-            "localized_titles": cluster.get("localized_titles", {}),
-            "localized_summaries": cluster.get("localized_summaries", {}),
-            "strength": cluster.get("strength", 0.5),
+    submission_count = len(submissions)
+    cache = await db["WeeklyInsights"].find_one({"key": "public_weekly_issues", "academic_week": week})
+    if (
+        cache
+        and cache.get("submission_count") == submission_count
+        and isinstance(cache.get("most_frequent"), list)
+        and cache["most_frequent"]
+    ):
+        return {
             "academic_week": week,
-            "last_detected": datetime.now(timezone.utc),
-            "first_detected": existing.get("first_detected") if existing else datetime.now(timezone.utc),
+            "most_frequent": cache["most_frequent"][:5],
+            "cached": True,
         }
-        await db["Issues"].update_one(
-            {"issue_key": issue_key, "academic_week": week},
-            {"$set": payload},
-            upsert=True,
-        )
-    await db["Issues"].delete_many({"academic_week": week, "issue_key": {"$nin": list(seen_keys)}})
 
+    points = ai_service.summarize_weekly_feedback_themes(submissions, max_points=5)
+    most_frequent = [{"title": p["title"], "summary": p["summary"]} for p in points[:5]]
 
-def _pick_localized(issue: dict[str, Any], lang: str) -> tuple[str, str]:
-    lang = lang if lang in ai_service.PUBLIC_LANGS else "en"
-    titles = issue.get("localized_titles") or {}
-    summaries = issue.get("localized_summaries") or {}
-    title = titles.get(lang) or issue.get("title", "")
-    summary = summaries.get(lang) or issue.get("ai_summary") or issue.get("description", "")
-    return str(title), str(summary)
-
-
-async def get_public_weekly_issues(week: int, lang: str = "en") -> dict[str, Any]:
-    db = get_database()
-    issues = (
-        await db["Issues"]
-        .find({"academic_week": week})
-        .sort([("frequency", -1), ("strength", -1)])
-        .to_list(20)
-    )
-    limited = _limit_public_clusters(
-        [
-            {
-                "frequency": i.get("frequency", 0),
-                "strength": i.get("strength", 0.5),
-                **i,
+    await db["WeeklyInsights"].update_one(
+        {"key": "public_weekly_issues", "academic_week": week},
+        {
+            "$set": {
+                "key": "public_weekly_issues",
+                "academic_week": week,
+                "submission_count": submission_count,
+                "most_frequent": most_frequent,
+                "generated_at": datetime.now(timezone.utc),
             }
-            for i in issues
-        ]
+        },
+        upsert=True,
     )
-    frequent = []
-    for issue in limited:
-        title, summary = _pick_localized(issue, lang)
-        frequent.append({"title": title, "summary": summary})
+
     return {
         "academic_week": week,
-        "most_frequent": frequent,
+        "most_frequent": most_frequent,
+        "cached": False,
     }
 
 
@@ -123,18 +74,22 @@ async def list_issues(week: int | None = None) -> list[dict[str, Any]]:
     query: dict[str, Any] = {}
     if week is not None:
         query["academic_week"] = week
-    docs = await db["Issues"].find(query).sort("frequency", -1).to_list(200)
+    docs = await db["Issues"].find(query).sort("created_at", -1).to_list(200)
     for d in docs:
         d["id"] = str(d.pop("_id"))
     return docs
 
 
 async def update_issue(issue_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
-    from bson import ObjectId
-
     db = get_database()
     await db["Issues"].update_one({"_id": ObjectId(issue_id)}, {"$set": updates})
     doc = await db["Issues"].find_one({"_id": ObjectId(issue_id)})
     if doc:
         doc["id"] = str(doc.pop("_id"))
     return doc
+
+
+async def sync_issues_for_week(week: int) -> None:
+    """Invalidate cached public weekly themes after new feedback arrives."""
+    db = get_database()
+    await db["WeeklyInsights"].delete_one({"key": "public_weekly_issues", "academic_week": week})

@@ -12,5 +12,5 @@ async def purge_expired_feedback() -> int:
         days = int(mode)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     db = get_database()
-    result = await db["Feedback"].delete_many({"created_at": {"$lt": cutoff}})
+    result = await db["Issues"].delete_many({"created_at": {"$lt": cutoff}})
     return int(result.deleted_count)
